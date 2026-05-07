@@ -37,7 +37,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Shared state (send side only)
 # ---------------------------------------------------------------------------
-
+VERSION = "0.1.3"
 STATE = {
     "root":            None,
     "passphrase_hash": None,
@@ -962,14 +962,17 @@ def main():
             "  deliverx.py send ./my_folder --port 9443\n"
             "  deliverx.py receive\n"
             "  deliverx.py          # same as receive\n"
+            "  deliverx.py --version\n"
         ),
     )
+    sub = ap.add_argument("--version", action="version", version=VERSION)
     sub = ap.add_subparsers(dest="cmd")
 
     send_p = sub.add_parser("send", help="Serve a file or directory")
     send_p.add_argument("path")
     send_p.add_argument("--host", default="0.0.0.0")
     send_p.add_argument("--port", type=int, default=8443)
+    
 
     sub.add_parser("receive", help="Receive files from a sender")
 

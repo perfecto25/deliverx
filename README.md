@@ -19,10 +19,10 @@ with main differences:
 ---
 ## Quick start
 
-Download the script from this repo
+Download the deliverx script from this repo
 
 ```
-curl -L -o deliverx https://tinyurl.com/perfecto25-deliverx
+curl -L -o deliverx https://tinyurl.com/get-deliverx
 ```
 
 chmod +x deliverx or run directly with 
@@ -31,6 +31,13 @@ chmod +x deliverx or run directly with
 python3 deliverx send myfile
 ```
 
+for permanent system-wide access you can add it to your /bin
+```
+curl -L -o deliverx https://tinyurl.com/get-deliverx
+chmod +x deliverx
+sudo mv deliverx /usr/local/bin/
+sudo ln -s /usr/local/bin/deliverx /usr/bin/deliverx
+```
 
 You need deliverx both on sender and receiver side.
 
