@@ -17,6 +17,21 @@ with main differences:
 ---
 ## Quick start
 
+Download the script from this repo
+
+```
+curl -L -o deliverx.py https://tinyurl.com/perfecto25-deliverx
+```
+
+chmod +x deliverx.py or run directly with 
+
+```
+python3 deliverx.py send myfile
+```
+
+You need deliverx.py both on sender and receiver side.
+
+
 ```bash
 # Sender — file or directory
 ./deliverx.py send /path/to/myfile.zip
