@@ -1,0 +1,974 @@
+#!/usr/bin/env python3
+## 2026 mike reider 
+## github.com/perfecto25/deliverx
+import argparse
+import base64
+import hashlib
+import html.parser
+import http.client
+import json
+import mimetypes
+import os
+import re
+import secrets
+import socket
+import ssl
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.request
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse
+
+# ---------------------------------------------------------------------------
+# Shared state (send side only)
+# ---------------------------------------------------------------------------
+
+STATE = {
+    "root":            None,
+    "passphrase_hash": None,
+    "token":           None,   # URL token — ?t=<value>
+    "serve_path":      None,
+    "use_tls":         True,   # False when a tunnel handles TLS
+    # Auto-shutdown bookkeeping: once at least one file has been fully
+    # streamed, no transfer is currently in flight, and a short idle grace
+    # period has elapsed, the server stops itself.
+    "active":          0,
+    "completed":       0,
+    "last_complete":   0.0,
+}
+
+STATE_LOCK = threading.Lock()
+
+# ---------------------------------------------------------------------------
+# Tunnel providers
+# ---------------------------------------------------------------------------
+
+SSH_QUIET_OPTS = [
+    "-o", "StrictHostKeyChecking=no",
+    "-o", "UserKnownHostsFile=/dev/null",
+    "-o", "ServerAliveInterval=30",
+    "-o", "LogLevel=ERROR",
+]
+
+TUNNEL_PROVIDERS = [
+    {
+        "name": "localhost.run",
+        "cmd": lambda port: [
+            "ssh", *SSH_QUIET_OPTS,
+            "-R", f"80:localhost:{port}",
+            "nokey@localhost.run",
+        ],
+        "pattern": re.compile(
+            r"https://(?:"
+            r"[a-zA-Z0-9\-]+\.lhr\.life"
+            r"|(?!admin\.)[a-zA-Z0-9\-]+\.localhost\.run"
+            r")"
+        ),
+    },
+    {
+        "name": "pinggy",
+        "cmd": lambda port: [
+            "ssh", *SSH_QUIET_OPTS,
+            "-p", "443",
+            f"-R0:localhost:{port}",
+            "qr@free.pinggy.io",
+        ],
+        "pattern": re.compile(
+            r"https://[a-zA-Z0-9\-]+\."
+            r"(?:run\.pinggy-free\.link|a\.pinggy\.(?:link|io))"
+        ),
+    },
+    {
+        "name": "serveo.net",
+        "cmd": lambda port: [
+            "ssh", *SSH_QUIET_OPTS,
+            "-R", f"80:localhost:{port}",
+            "serveo.net",
+        ],
+        "pattern": re.compile(
+            r"https://(?:"
+            r"[a-zA-Z0-9\-]+\.serveousercontent\.com"
+            r"|(?!console\.|www\.)[a-zA-Z0-9\-]+\.serveo\.net"
+            r")"
+        ),
+    },
+]
+
+
+def _try_tunnel(provider: dict, port: int, timeout: float = 20.0) -> tuple[str | None, subprocess.Popen | None]:
+    cmd = provider["cmd"](port)
+    url_found: list[str] = []
+    captured: list[str] = []
+    found_event = threading.Event()
+    debug = os.environ.get("DELIVERX_DEBUG_TUNNEL") == "1"
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+            start_new_session=True,
+        )
+    except FileNotFoundError:
+        return None, None
+
+    def _reader():
+        # Keep draining stdout for the lifetime of the process so the pipe
+        # never fills and stalls ssh. Stop matching once the URL is found.
+        for line in proc.stdout:
+            captured.append(line)
+            if debug:
+                sys.stderr.write(f"[{provider['name']}] {line}")
+                sys.stderr.flush()
+            if not url_found:
+                m = provider["pattern"].search(line)
+                if m:
+                    url_found.append(m.group(0))
+                    found_event.set()
+
+    t = threading.Thread(target=_reader, daemon=True)
+    t.start()
+    found_event.wait(timeout=timeout)
+
+    if url_found:
+        return url_found[0], proc
+
+    proc.terminate()
+    try:
+        proc.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+
+    # Surface what ssh actually emitted so we can fix patterns when providers shift.
+    if captured and not debug:
+        tail = "".join(captured[-20:]).rstrip()
+        if tail:
+            sys.stderr.write(f"\n    [{provider['name']} output]\n")
+            for ln in tail.splitlines():
+                sys.stderr.write(f"      {ln}\n")
+            sys.stderr.flush()
+    return None, None
+
+
+def _enabled_providers() -> list[dict]:
+    """Optionally restrict to a single provider — used by the health-check
+    test to exercise providers one at a time."""
+    only = os.environ.get("DELIVERX_ONLY_TUNNEL")
+    if only:
+        return [p for p in TUNNEL_PROVIDERS if p["name"] == only]
+    return list(TUNNEL_PROVIDERS)
+
+
+def start_tunnel(port: int) -> tuple[str | None, subprocess.Popen | None]:
+    for provider in _enabled_providers():
+        name = provider["name"]
+        print(f"  Trying {name}...", end=" ", flush=True)
+        url, proc = _try_tunnel(provider, port)
+        if url:
+            print(f"OK -> {url}")
+            return url, proc
+        print("failed")
+    return None, None
+
+
+URL_SHORTENERS = [
+    ("tinyurl",  "https://tinyurl.com/api-create.php?url={url}"),
+    ("is.gd",    "https://is.gd/create.php?format=simple&url={url}"),
+    ("v.gd",     "https://v.gd/create.php?format=simple&url={url}"),
+]
+
+
+def _short_url_redirects_to(short: str, expected_host: str, timeout: float,
+                            debug: bool = False) -> bool:
+    """Confirm the shortener actually 30x-redirects to expected_host. Some
+    shorteners (is.gd / v.gd) show an anti-phishing interstitial for URLs
+    that look IP-like, in which case the short URL is useless to us. We
+    inspect the Location header directly instead of following the redirect,
+    so we never actually hit the tunnel (which may not be serving yet)."""
+    parsed = urlparse(short)
+    try:
+        if parsed.scheme == "https":
+            conn = http.client.HTTPSConnection(parsed.netloc, timeout=timeout)
+        else:
+            conn = http.client.HTTPConnection(parsed.netloc, timeout=timeout)
+        path = parsed.path or "/"
+        if parsed.query:
+            path += "?" + parsed.query
+        conn.request("GET", path, headers={"User-Agent": "Mozilla/5.0"})
+        resp = conn.getresponse()
+        status = resp.status
+        location = resp.getheader("Location", "")
+        resp.read()
+        conn.close()
+    except Exception as e:
+        if debug:
+            sys.stderr.write(f"\n      verify error: {e!r}")
+        return False
+    if debug:
+        sys.stderr.write(f"\n      verify status={status} location={location!r}")
+    if not location:
+        return False
+    return urlparse(urljoin(short, location)).netloc == expected_host
+
+
+def shorten_url(long_url: str, timeout: float = 5.0) -> str | None:
+    """Return a shortened URL that redirects cleanly to long_url, else None."""
+    debug = os.environ.get("DELIVERX_DEBUG_SHORTEN") == "1"
+    encoded = quote(long_url, safe="")
+    expected_host = urlparse(long_url).netloc
+    # Try a sequence of UAs — tinyurl rejects the generic "Mozilla/5.0"
+    # with 400, while is.gd/v.gd are happy with anything; default
+    # Python-urllib UA is fine for tinyurl. The first UA that produces a
+    # valid http(s) URL response wins.
+    UA_FALLBACKS = [
+        "curl/8.5.0",
+        "Mozilla/5.0 (X11; Linux x86_64; rv:121.0) Gecko/20100101 Firefox/121.0",
+        None,  # urllib default
+    ]
+
+    only = os.environ.get("DELIVERX_ONLY_SHORTENER")
+    shorteners = [(n, t) for n, t in URL_SHORTENERS if (not only or n == only)]
+    for name, template in shorteners:
+        if debug:
+            sys.stderr.write(f"\n    [{name}] requesting...")
+        short = None
+        last_err: Exception | None = None
+        for ua in UA_FALLBACKS:
+            headers = {"User-Agent": ua} if ua else {}
+            try:
+                req = urllib.request.Request(template.format(url=encoded), headers=headers)
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    candidate = resp.read().decode().strip()
+            except Exception as e:
+                last_err = e
+                if debug:
+                    sys.stderr.write(f"\n    [{name}] ua={ua!r} failed: {e!r}")
+                continue
+            if candidate.startswith("http://") or candidate.startswith("https://"):
+                short = candidate
+                break
+            if debug:
+                sys.stderr.write(f"\n    [{name}] ua={ua!r} non-URL: {candidate[:120]!r}")
+        if short is None:
+            if debug and last_err is not None:
+                sys.stderr.write(f"\n    [{name}] all UAs failed (last: {last_err!r})")
+            continue
+        if debug:
+            sys.stderr.write(f"\n    [{name}] got {short}, verifying redirect...")
+        if _short_url_redirects_to(short, expected_host, timeout, debug=debug):
+            if debug:
+                sys.stderr.write("\n")
+            return short
+    if debug:
+        sys.stderr.write("\n")
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def get_local_addr():
+    return socket.getfqdn()
+
+
+def pbkdf2_hash(passphrase: str, salt: bytes) -> str:
+    dk = hashlib.pbkdf2_hmac("sha256", passphrase.encode(), salt, 200_000)
+    return base64.urlsafe_b64encode(salt + dk).decode().rstrip("=")
+
+
+def pbkdf2_verify(passphrase: str, encoded: str) -> bool:
+    raw = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
+    salt, digest = raw[:16], raw[16:]
+    test = hashlib.pbkdf2_hmac("sha256", passphrase.encode(), salt, 200_000)
+    return secrets.compare_digest(digest, test)
+
+
+def generate_passphrase() -> str:
+    words = [
+        "apple", "brisk", "canyon", "delta", "ember", "forest", "glacier", "harbor",
+        "island", "juniper", "kitten", "lunar", "meadow", "nebula", "oasis", "pioneer",
+        "quiet", "rocket", "sierra", "tidal", "umber", "violet", "willow", "zephyr",
+    ]
+    return "-".join(secrets.choice(words) for _ in range(4))
+
+
+def make_self_signed_cert(cert_dir: Path, host: str):
+    key = cert_dir / "key.pem"
+    crt = cert_dir / "cert.pem"
+    if key.exists() and crt.exists():
+        return str(crt), str(key)
+    cmd = [
+        "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
+        "-keyout", str(key), "-out", str(crt), "-days", "365",
+        "-subj", f"/CN={host}",
+    ]
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return str(crt), str(key)
+
+
+def safe_join(root: Path, rel: str) -> Path:
+    rel = rel.lstrip("/").replace("\\", "/")
+    target = (root / rel).resolve()
+    if root.resolve() not in target.parents and target != root.resolve():
+        raise ValueError("path traversal blocked")
+    return target
+
+
+def html_escape(s: str) -> str:
+    return (
+        s.replace("&", "&amp;")
+         .replace("<", "&lt;")
+         .replace(">", "&gt;")
+         .replace('"', "&quot;")
+    )
+
+
+def check_token(query_string: str) -> bool:
+    """Validate ?t=<token> query parameter."""
+    params = parse_qs(query_string)
+    t = params.get("t", [""])[0]
+    return bool(STATE["token"] and secrets.compare_digest(t, STATE["token"]))
+
+
+def _stream_file(handler: BaseHTTPRequestHandler, src: Path):
+    """Stream a file body to the client, updating the auto-shutdown counters
+    so the server can stop itself once the receiver is done. Active is always
+    decremented even if the receiver disconnects mid-stream; completed only
+    advances on a clean finish."""
+    with STATE_LOCK:
+        STATE["active"] += 1
+    try:
+        with open(src, "rb") as f:
+            while chunk := f.read(1024 * 1024):
+                handler.wfile.write(chunk)
+        with STATE_LOCK:
+            STATE["completed"]     += 1
+            STATE["last_complete"]  = time.time()
+    finally:
+        with STATE_LOCK:
+            STATE["active"] -= 1
+
+
+def append_token(path: str) -> str:
+    """Append ?t=<token> to a path."""
+    sep = "&" if "?" in path else "?"
+    return f"{path}{sep}t={STATE['token']}"
+
+
+# ---------------------------------------------------------------------------
+# Server (send side)
+# ---------------------------------------------------------------------------
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):
+        return  # silence access log
+
+    def send_html(self, code: int, body: str, extra_headers: dict | None = None):
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        if extra_headers:
+            for k, v in extra_headers.items():
+                self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(body.encode())
+
+    def do_GET(self):
+        parsed   = urlparse(self.path)
+        path     = parsed.path
+        query    = parsed.query
+        authed   = check_token(query)
+
+        # ── Unlock via GET (tunnel-safe: no POST needed) ──────────────────
+        if path == "/unlock":
+            params     = parse_qs(query)
+            passphrase = params.get("passphrase", [""])[0]
+            if not passphrase:
+                self.send_html(400, "<html><body>Missing passphrase.</body></html>")
+                return
+            if not pbkdf2_verify(passphrase, STATE["passphrase_hash"]):
+                self.send_html(200, """
+<html><body>
+<h2>deliverx — wrong passphrase, try again</h2>
+<form method="GET" action="/unlock">
+  <input name="passphrase" type="password" style="width:340px" autofocus
+         placeholder="word-word-word-word">
+  <button type="submit">Unlock</button>
+</form>
+</body></html>
+""")
+                return
+            self.send_html(302, "<html><body>OK</body></html>", {
+                "Location": append_token("/"),
+            })
+            return
+
+        # ── Root ──────────────────────────────────────────────────────────
+        if path == "/":
+            if authed:
+                root       = STATE["root"]
+                serve_path = STATE["serve_path"]
+
+                if root.is_file():
+                    # Single-file mode: serve the file directly
+                    self.send_response(HTTPStatus.OK)
+                    ctype = mimetypes.guess_type(root.name)[0] or "application/octet-stream"
+                    self.send_header("Content-Type", ctype)
+                    self.send_header("Content-Disposition", f'attachment; filename="{root.name}"')
+                    self.send_header("Cache-Control", "no-store")
+                    self.end_headers()
+                    _stream_file(self, root)
+                    return
+
+                # Directory listing
+                entries = []
+                for p in sorted(serve_path.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower())):
+                    rel    = quote(p.name)
+                    suffix = "/" if p.is_dir() else ""
+                    href   = append_token(f"/browse/{rel}{suffix}")
+                    entries.append(f'<li><a href="{href}">{html_escape(p.name)}{suffix}</a></li>')
+                self.send_html(200, (
+                    "<html><body><h2>Files</h2><ul>"
+                    + "".join(entries)
+                    + "</ul></body></html>"
+                ))
+                return
+
+            # Not authenticated — show passphrase form (GET so tunnels don't mangle it)
+            self.send_html(200, """
+<html><body>
+<h2>deliverx — enter passphrase</h2>
+<form method="GET" action="/unlock">
+  <input name="passphrase" type="password" style="width:340px" autofocus
+         placeholder="word-word-word-word">
+  <button type="submit">Unlock</button>
+</form>
+</body></html>
+""")
+            return
+
+        # ── Browse ────────────────────────────────────────────────────────
+        if path.startswith("/browse/"):
+            if not authed:
+                self.send_html(403, "<html><body>Forbidden</body></html>")
+                return
+
+            rel  = unquote(path[len("/browse/"):])
+            root = STATE["serve_path"].resolve()
+            try:
+                target = safe_join(root, rel)
+            except ValueError:
+                self.send_html(403, "<html><body>Forbidden</body></html>")
+                return
+
+            if target.is_dir():
+                items = []
+                if target != root:
+                    parent     = quote(str(Path(rel).parent).replace("\\", "/"))
+                    parent_rel = parent if parent != "." else ""
+                    items.append(f'<li><a href="{append_token(f"/browse/{parent_rel}")}">../</a></li>')
+                for p in sorted(target.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower())):
+                    child_rel = quote(str((Path(rel) / p.name).as_posix()))
+                    suffix    = "/" if p.is_dir() else ""
+                    href      = append_token(f"/browse/{child_rel}{suffix}")
+                    items.append(f'<li><a href="{href}">{html_escape(p.name)}{suffix}</a></li>')
+                label = str(target.relative_to(root)) or "."
+                self.send_html(200, (
+                    f"<html><body><h2>{html_escape(label)}</h2><ul>"
+                    + "".join(items)
+                    + "</ul></body></html>"
+                ))
+                return
+
+            if target.is_file():
+                self.send_response(HTTPStatus.OK)
+                ctype = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Disposition", f'attachment; filename="{target.name}"')
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                _stream_file(self, target)
+                return
+
+            self.send_html(404, "<html><body>Not found</body></html>")
+            return
+
+        self.send_html(404, "<html><body>Not found</body></html>")
+
+
+
+
+# ---------------------------------------------------------------------------
+# Run server
+# ---------------------------------------------------------------------------
+
+def run_server(target: Path, bind_host: str, port: int):
+    passphrase = generate_passphrase()
+    salt       = secrets.token_bytes(16)
+    STATE["passphrase_hash"] = pbkdf2_hash(passphrase, salt)
+    STATE["token"]           = secrets.token_urlsafe(24)
+    STATE["serve_path"]      = target if target.is_dir() else target.parent
+    STATE["root"]            = target
+
+    local_addr = get_local_addr()
+
+    # Attempt tunnel first — tunnels handle TLS themselves so we serve plain HTTP
+    print("Looking for a public tunnel...")
+    tunnel_url, tunnel_proc = start_tunnel(port)
+
+    short_url = None
+    if tunnel_url:
+        print("Shortening URL...", end=" ", flush=True)
+        short_url = shorten_url(tunnel_url)
+        print("OK" if short_url else "failed")
+
+    httpd = ThreadingHTTPServer((bind_host, port), Handler)
+
+    if tunnel_url:
+        STATE["use_tls"] = False
+        scheme = "http"
+    else:
+        STATE["use_tls"] = True
+        scheme = "https"
+        cert_dir           = Path(tempfile.mkdtemp(prefix="deliverx-"))
+        certfile, keyfile  = make_self_signed_cert(cert_dir, local_addr)
+        tls_ctx            = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        tls_ctx.load_cert_chain(certfile=certfile, keyfile=keyfile)
+        httpd.socket       = tls_ctx.wrap_socket(httpd.socket, server_side=True)
+
+    kind  = "File" if target.is_file() else "Directory"
+    label = target.name if target.is_file() else str(target)
+    primary_url = short_url or tunnel_url or "(none - LAN only)"
+
+    # Highlight what the receiver needs to type. ANSI 30;43 = black text on
+    # yellow background.
+    hl = lambda s: f"\033[30;43m{s}\033[0m"
+
+    lines = [
+        "",
+        "----------------------------------------------------",
+        hl(f"  Public URL : {primary_url}  "),
+        hl(f"  Passphrase : {passphrase}  "),
+    ]
+    if short_url and tunnel_url and short_url != tunnel_url:
+        lines.append(f"  Full URL   : {tunnel_url}")
+    lines += [
+        f"  Local URL  : {scheme}://{local_addr}:{port}/",
+        f"  {kind}      : {label}",
+        "----------------------------------------------------",
+        "  Waiting for receiver... (Ctrl-C to stop)",
+    ]
+    sys.stdout.write("\n".join(lines) + "\n")
+    sys.stdout.flush()
+
+    def _autoshutdown():
+        # Stop the server once the receiver has finished pulling files: at
+        # least one transfer completed, none currently in flight, and a
+        # short idle window has passed (so a multi-file directory transfer
+        # isn't cut off between files). Also enforce a hard session cap so
+        # the public tunnel never stays up indefinitely.
+        idle_grace      = 5.0
+        max_session_sec = 30 * 60
+        started         = time.time()
+        while True:
+            time.sleep(1)
+            elapsed = time.time() - started
+            with STATE_LOCK:
+                completed = STATE["completed"]
+                active    = STATE["active"]
+                last      = STATE["last_complete"]
+            if completed > 0 and active == 0 and time.time() - last > idle_grace:
+                print(f"\nTransfer complete ({completed} file{'s' if completed != 1 else ''}). Shutting down.")
+                httpd.shutdown()
+                return
+            if elapsed > max_session_sec:
+                print(f"\nSession timed out after {int(max_session_sec / 60)} minutes. Shutting down.")
+                httpd.shutdown()
+                return
+
+    threading.Thread(target=_autoshutdown, daemon=True).start()
+
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if tunnel_proc:
+            tunnel_proc.terminate()
+            try:
+                tunnel_proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                tunnel_proc.kill()
+
+
+# ---------------------------------------------------------------------------
+# Receive side
+# ---------------------------------------------------------------------------
+
+class _LinkParser(html.parser.HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.links: list[str] = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "a":
+            for name, val in attrs:
+                if name == "href" and val:
+                    self.links.append(val)
+
+
+def _make_ssl_ctx() -> ssl.SSLContext:
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode    = ssl.CERT_NONE
+    return ctx
+
+
+# Headers used for any request that talks to the *tunnel*. We use a
+# non-browser UA so pinggy's free-tier web debugger passes the request
+# through (it only intercepts browser-like UAs). bypass-tunnel-reminder
+# skips pinggy's "tunnel will expire" warning page; ngrok-skip-browser-warning
+# is a similar convention adopted by several tunnel providers.
+RECEIVER_HEADERS = [
+    ("User-Agent", "curl/8.5.0"),
+    ("bypass-tunnel-reminder", "yes"),
+    ("ngrok-skip-browser-warning", "true"),
+]
+
+
+def _build_opener(ctx: ssl.SSLContext, https: bool) -> urllib.request.OpenerDirector:
+    if https:
+        opener = urllib.request.build_opener(urllib.request.HTTPSHandler(context=ctx))
+    else:
+        opener = urllib.request.build_opener()
+    opener.addheaders = list(RECEIVER_HEADERS)
+    return opener
+
+
+SHORTENER_HOSTS  = {"is.gd", "v.gd", "tinyurl.com"}
+MAX_REDIRECT_HOPS = 5
+
+
+def _resolve_url(url: str, ctx: ssl.SSLContext, timeout: float = 10.0) -> str:
+    """Expand shortener URLs to their tunnel target.
+
+    We follow redirects manually with http.client so we can use a browser
+    UA only at the shortener hop (some shorteners serve an anti-phishing
+    interstitial otherwise) and stop the moment we leave the shortener
+    domain — this keeps pinggy's web debugger out of the picture, since we
+    never actually fetch the tunnel root with a browser-like UA.
+    """
+    debug = os.environ.get("DELIVERX_DEBUG") == "1"
+    parsed = urlparse(url)
+
+    # Not a known shortener — assume it's already the tunnel URL.
+    if parsed.netloc.lower() not in SHORTENER_HOSTS:
+        return f"{parsed.scheme}://{parsed.netloc}/"
+
+    current = url
+    for _ in range(MAX_REDIRECT_HOPS):
+        cp = urlparse(current)
+        if cp.scheme == "https":
+            conn = http.client.HTTPSConnection(cp.netloc, timeout=timeout, context=ctx)
+        else:
+            conn = http.client.HTTPConnection(cp.netloc, timeout=timeout)
+        path = cp.path or "/"
+        if cp.query:
+            path += "?" + cp.query
+        try:
+            conn.request("GET", path, headers={"User-Agent": "Mozilla/5.0"})
+            resp     = conn.getresponse()
+            status   = resp.status
+            location = resp.getheader("Location", "")
+            resp.read()
+        finally:
+            conn.close()
+
+        if debug:
+            sys.stderr.write(f"\n  [resolve] {current} -> status={status} location={location!r}")
+
+        if not (300 <= status < 400 and location):
+            raise RuntimeError(
+                f"Short URL did not redirect (status {status} at {cp.netloc}). "
+                f"Try the Full URL shown by the sender instead."
+            )
+
+        current = urljoin(current, location)
+        cp_next = urlparse(current)
+        if cp_next.netloc.lower() not in SHORTENER_HOSTS:
+            if debug:
+                sys.stderr.write(f"\n  [resolve] resolved to {cp_next.scheme}://{cp_next.netloc}/\n")
+            return f"{cp_next.scheme}://{cp_next.netloc}/"
+
+    raise RuntimeError("Too many redirects while resolving short URL.")
+
+
+def _open(url: str, ctx: ssl.SSLContext, data: bytes | None = None) -> urllib.request.Request:
+    """Build and open a request, using SSL ctx only for https."""
+    req = urllib.request.Request(url, data=data, headers=dict(RECEIVER_HEADERS))
+    if data:
+        req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    if url.startswith("https://"):
+        return urllib.request.urlopen(req, context=ctx)
+    return urllib.request.urlopen(req)
+
+
+def _authenticate(base_url: str, passphrase: str, ctx: ssl.SSLContext) -> str:
+    """
+    GET /unlock?passphrase=... through the tunnel.
+    The server 302-redirects to /?t=TOKEN on success, or returns 200 (wrong passphrase form).
+    We let urllib follow the redirect normally and check where we land.
+    The token in the final URL is what we keep for all future requests.
+    """
+    debug = os.environ.get("DELIVERX_DEBUG") == "1"
+    unlock_url = urljoin(base_url, f"/unlock?passphrase={quote(passphrase)}")
+    opener = _build_opener(ctx, base_url.startswith("https://"))
+
+    if debug:
+        sys.stderr.write(f"\n  [auth] base_url={base_url}\n")
+        sys.stderr.write(f"  [auth] unlock_url={unlock_url}\n")
+
+    try:
+        resp     = opener.open(unlock_url, timeout=15)
+        final    = resp.geturl()   # URL after following any redirects
+        body     = resp.read()
+        if debug:
+            sys.stderr.write(f"  [auth] final={final} status={resp.status}\n")
+            sys.stderr.write(f"  [auth] body[:200]={body[:200]!r}\n")
+    except urllib.error.HTTPError as e:
+        if debug:
+            try:
+                err_body = e.read()[:500]
+                sys.stderr.write(f"\n  [auth] HTTPError {e.code} url={e.url}\n")
+                sys.stderr.write(f"  [auth] body[:500]={err_body!r}\n")
+            except Exception:
+                pass
+        raise RuntimeError(f"Server error (HTTP {e.code}).")
+    except Exception as e:
+        raise RuntimeError(f"Connection error: {e}")
+
+    # If passphrase was wrong, server returns 200 with the form again
+    # If correct, server 302-redirected to /?t=TOKEN — final URL has the token
+    parsed = urlparse(final)
+    token  = parse_qs(parsed.query).get("t", [""])[0]
+    if not token:
+        raise RuntimeError("Wrong passphrase.")
+
+    # Rebuild using the original base_url host (not whatever the tunnel rewrote it to)
+    return urljoin(base_url, f"/?t={token}")
+
+
+def _fetch_html(url: str, ctx: ssl.SSLContext) -> list[str]:
+    """Fetch a URL and return all href links found in the HTML."""
+    with _open(url, ctx) as resp:
+        body = resp.read().decode(errors="replace")
+    parser = _LinkParser()
+    parser.feed(body)
+    return parser.links
+
+
+def _content_disposition_filename(headers) -> str | None:
+    cd = headers.get("Content-Disposition", "")
+    for part in cd.split(";"):
+        part = part.strip()
+        if part.lower().startswith("filename="):
+            return part[9:].strip().strip('"')
+    return None
+
+
+def _download_file(url: str, ctx: ssl.SSLContext, dest_dir: Path) -> Path:
+    with _open(url, ctx) as resp:
+        filename = _content_disposition_filename(resp.headers)
+        if not filename:
+            filename = unquote(urlparse(url).path.rstrip("/").split("/")[-1]) or "download"
+        filename = Path(filename).name or "download"
+
+        dest   = dest_dir / filename
+        stem, suffix = dest.stem, dest.suffix
+        n = 1
+        while dest.exists():
+            dest = dest_dir / f"{stem}_{n}{suffix}"
+            n += 1
+
+        total    = int(resp.headers.get("Content-Length", "0") or "0")
+        received = 0
+        with open(dest, "wb") as f:
+            while chunk := resp.read(1024 * 1024):
+                f.write(chunk)
+                received += len(chunk)
+                if total:
+                    pct = received * 100 // total
+                    bar = "#" * (pct // 2) + "-" * (50 - pct // 2)
+                    print(f"\r  [{bar}] {pct:3d}%  {received/1024/1024:.1f} MB",
+                          end="", flush=True)
+        if total:
+            print()
+    return dest
+
+
+def _collect_files(base_url: str, auth_root: str, browse_href: str,
+                   ctx: ssl.SSLContext) -> list[tuple[str, str]]:
+    """
+    Recursively collect (download_url, label) for every file under browse_href.
+    browse_href already contains ?t=... because the server embeds it in links.
+    """
+    url  = urljoin(base_url, browse_href)
+    links = _fetch_html(url, ctx)
+
+    results = []
+    for href in links:
+        if not href or href in ("../", "./"):
+            continue
+        # Make absolute
+        abs_href = urljoin(url, href)
+        if href.endswith("/"):
+            results.extend(_collect_files(base_url, auth_root, abs_href, ctx))
+        else:
+            label = unquote(urlparse(abs_href).path.rstrip("/").split("/")[-1])
+            results.append((abs_href, label))
+    return results
+
+
+def receive_interactive():
+    ctx = _make_ssl_ctx()
+
+    print("=== deliverx receive ===")
+    raw_url    = input("Enter URL (e.g. https://abc123.localhost.run): ").strip().rstrip("/")
+    passphrase = input("Enter passphrase: ").strip()
+    cwd        = Path.cwd()
+    dest_input = input(f"Save to [default: {cwd}]: ").strip()
+    dest_dir   = Path(dest_input).expanduser().resolve() if dest_input else cwd
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        base_url = _resolve_url(raw_url, ctx)
+    except Exception as e:
+        raise SystemExit(f"Could not resolve URL: {e}")
+
+    print("Authenticating...", end=" ", flush=True)
+    try:
+        auth_url = _authenticate(base_url, passphrase, ctx)
+    except RuntimeError as e:
+        raise SystemExit(str(e))
+    print("OK")
+
+    # Fetch the authenticated root page to see what's there
+    links        = _fetch_html(auth_url, ctx)
+    browse_links = [h for h in links if "/browse/" in h]
+
+    if not browse_links:
+        # Single-file mode — /?t=TOKEN serves the file directly
+        filename = unquote(urlparse(auth_url).path.split("/")[-1]) or "file"
+        print(f"\nFile ready to download.")
+        confirm = input("Enter 'y' to receive: ").strip().lower()
+        if confirm != "y":
+            print("Cancelled.")
+            return
+        print(f"Downloading to {dest_dir}/...")
+        dest = _download_file(auth_url, ctx, dest_dir)
+        print(f"  Saved -> {dest}")
+    else:
+        # Directory mode — collect all files recursively
+        all_files: list[tuple[str, str]] = []
+        for href in browse_links:
+            abs_href = urljoin(base_url, href)
+            if href.endswith("/"):
+                all_files.extend(_collect_files(base_url, auth_url, abs_href, ctx))
+            else:
+                label = unquote(urlparse(abs_href).path.rstrip("/").split("/")[-1])
+                all_files.append((abs_href, label))
+
+        if not all_files:
+            raise SystemExit("No files found on the remote.")
+
+        print(f"\n{len(all_files)} file(s) available:")
+        for i, (_, label) in enumerate(all_files, 1):
+            print(f"  [{i:3d}] {label}")
+
+        choice = input(
+            "\nEnter numbers to download (e.g. 1,3-5), 'all', or 'q' to quit: "
+        ).strip().lower()
+
+        if choice in ("q", ""):
+            print("Cancelled.")
+            return
+
+        if choice == "all":
+            selected = list(range(len(all_files)))
+        else:
+            selected = []
+            for part in choice.split(","):
+                part = part.strip()
+                if "-" in part:
+                    a, _, b = part.partition("-")
+                    try:
+                        selected.extend(range(int(a) - 1, int(b)))
+                    except ValueError:
+                        raise SystemExit(f"Invalid range: {part}")
+                else:
+                    try:
+                        selected.append(int(part) - 1)
+                    except ValueError:
+                        raise SystemExit(f"Invalid number: {part}")
+
+        selected = sorted(set(selected))
+        if not selected or any(i < 0 or i >= len(all_files) for i in selected):
+            raise SystemExit("Invalid selection.")
+
+        print(f"\nDownloading {len(selected)} file(s) to {dest_dir}/...")
+        for i in selected:
+            url, label = all_files[i]
+            print(f"\n  {label}")
+            dest = _download_file(url, ctx, dest_dir)
+            print(f"  Saved -> {dest}")
+
+    print("\nDone.")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main():
+    ap = argparse.ArgumentParser(
+        description="deliverx - simple encrypted file transfer",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  deliverx.py send myfile.zip\n"
+            "  deliverx.py send ./my_folder --port 9443\n"
+            "  deliverx.py receive\n"
+            "  deliverx.py          # same as receive\n"
+        ),
+    )
+    sub = ap.add_subparsers(dest="cmd")
+
+    send_p = sub.add_parser("send", help="Serve a file or directory")
+    send_p.add_argument("path")
+    send_p.add_argument("--host", default="0.0.0.0")
+    send_p.add_argument("--port", type=int, default=8443)
+
+    sub.add_parser("receive", help="Receive files from a sender")
+
+    args = ap.parse_args()
+
+    if args.cmd == "send":
+        target = Path(args.path).expanduser().resolve()
+        if not target.exists():
+            raise SystemExit(f"Not found: {target}")
+        run_server(target, args.host, args.port)
+    else:
+        receive_interactive()
+
+
+if __name__ == "__main__":
+    main()
