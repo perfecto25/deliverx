@@ -177,15 +177,53 @@ def _enabled_providers() -> List[dict]:
     return list(TUNNEL_PROVIDERS)
 
 
+def _verify_tunnel_routes(url: str, timeout: float = 5.0,
+                          retries: int = 4, delay: float = 2.0) -> bool:
+    """Return True if the tunnel URL actually routes to our local server."""
+    ctx = _make_ssl_ctx()
+    target = url.rstrip("/") + "/"
+    for attempt in range(retries):
+        if attempt > 0:
+            time.sleep(delay)
+        try:
+            req = urllib.request.Request(target, headers=dict(RECEIVER_HEADERS))
+            with urllib.request.urlopen(req, context=ctx, timeout=timeout) as resp:
+                return resp.status < 500
+        except urllib.error.HTTPError as e:
+            if e.code < 500:
+                return True
+        except Exception:
+            pass
+    return False
+
+
 def start_tunnel(port: int) -> Tuple[Optional[str], Optional[subprocess.Popen]]:
+    fallback: Tuple[Optional[str], Optional[subprocess.Popen]] = (None, None)
     for provider in _enabled_providers():
         name = provider["name"]
         print(f"  Trying {name}...", end=" ", flush=True)
         url, proc = _try_tunnel(provider, port)
-        if url:
-            print(f"OK -> {url}")
+        if not url:
+            print("failed")
+            continue
+        sys.stdout.write(f"connected ({url}), verifying route...")
+        sys.stdout.flush()
+        if _verify_tunnel_routes(url):
+            print(" OK")
             return url, proc
-        print("failed")
+        print(" 503 (not routing)")
+        # Keep as fallback in case all providers fail verification (e.g. hairpin NAT)
+        if fallback[0] is None:
+            fallback = (url, proc)
+        else:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+    if fallback[0]:
+        print(f"  WARNING: tunnel route unverified — receiver may still reach it")
+        return fallback
     return None, None
 
 
@@ -533,9 +571,34 @@ def run_server(target: Path, bind_host: str, port: int):
 
     local_addr = get_local_addr()
 
-    # Attempt tunnel first — tunnels handle TLS themselves so we serve plain HTTP
+    # Start the HTTP server before the tunnel so the port is listening when
+    # localhost.run performs its initial health-check on the reverse tunnel.
+    STATE["use_tls"] = False
+    httpd = ThreadingHTTPServer((bind_host, port), Handler)
+    serve_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    serve_thread.start()
+
+    tunnel_url:  Optional[str]               = None
+    tunnel_proc: Optional[subprocess.Popen] = None
+    scheme = "http"
+
     print("Looking for a public tunnel...")
     tunnel_url, tunnel_proc = start_tunnel(port)
+
+    if not tunnel_url:
+        # No tunnel — rebuild with TLS for direct LAN access.
+        httpd.shutdown()
+        serve_thread.join(timeout=3)
+        STATE["use_tls"] = True
+        scheme = "https"
+        httpd = ThreadingHTTPServer((bind_host, port), Handler)
+        cert_dir          = Path(tempfile.mkdtemp(prefix="deliverx-"))
+        certfile, keyfile = make_self_signed_cert(cert_dir, local_addr)
+        tls_ctx           = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        tls_ctx.load_cert_chain(certfile=certfile, keyfile=keyfile)
+        httpd.socket      = tls_ctx.wrap_socket(httpd.socket, server_side=True)
+        serve_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        serve_thread.start()
 
     short_url = None
     if tunnel_url:
@@ -543,26 +606,10 @@ def run_server(target: Path, bind_host: str, port: int):
         short_url = shorten_url(tunnel_url)
         print("OK" if short_url else "failed")
 
-    httpd = ThreadingHTTPServer((bind_host, port), Handler)
-
-    if tunnel_url:
-        STATE["use_tls"] = False
-        scheme = "http"
-    else:
-        STATE["use_tls"] = True
-        scheme = "https"
-        cert_dir           = Path(tempfile.mkdtemp(prefix="deliverx-"))
-        certfile, keyfile  = make_self_signed_cert(cert_dir, local_addr)
-        tls_ctx            = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        tls_ctx.load_cert_chain(certfile=certfile, keyfile=keyfile)
-        httpd.socket       = tls_ctx.wrap_socket(httpd.socket, server_side=True)
-
     kind  = "File" if target.is_file() else "Directory"
     label = target.name if target.is_file() else str(target)
     primary_url = short_url or tunnel_url or "(none - LAN only)"
 
-    # Highlight what the receiver needs to type. ANSI 30;43 = black text on
-    # yellow background.
     hl = lambda s: f"\033[30;43m{s}\033[0m"
 
     lines = [
@@ -583,11 +630,6 @@ def run_server(target: Path, bind_host: str, port: int):
     sys.stdout.flush()
 
     def _autoshutdown():
-        # Stop the server once the receiver has finished pulling files: at
-        # least one transfer completed, none currently in flight, and a
-        # short idle window has passed (so a multi-file directory transfer
-        # isn't cut off between files). Also enforce a hard session cap so
-        # the public tunnel never stays up indefinitely.
         idle_grace      = 5.0
         max_session_sec = 30 * 60
         started         = time.time()
@@ -610,9 +652,11 @@ def run_server(target: Path, bind_host: str, port: int):
     threading.Thread(target=_autoshutdown, daemon=True).start()
 
     try:
-        httpd.serve_forever()
+        while serve_thread.is_alive():
+            serve_thread.join(timeout=1)
     except KeyboardInterrupt:
-        pass
+        httpd.shutdown()
+        serve_thread.join(timeout=3)
     finally:
         if tunnel_proc:
             tunnel_proc.terminate()
@@ -749,24 +793,39 @@ def _authenticate(base_url: str, passphrase: str, ctx: ssl.SSLContext) -> str:
         sys.stderr.write(f"\n  [auth] base_url={base_url}\n")
         sys.stderr.write(f"  [auth] unlock_url={unlock_url}\n")
 
-    try:
-        resp     = opener.open(unlock_url, timeout=15)
-        final    = resp.geturl()   # URL after following any redirects
-        body     = resp.read()
-        if debug:
-            sys.stderr.write(f"  [auth] final={final} status={resp.status}\n")
-            sys.stderr.write(f"  [auth] body[:200]={body[:200]!r}\n")
-    except urllib.error.HTTPError as e:
-        if debug:
-            try:
-                err_body = e.read()[:500]
-                sys.stderr.write(f"\n  [auth] HTTPError {e.code} url={e.url}\n")
-                sys.stderr.write(f"  [auth] body[:500]={err_body!r}\n")
-            except Exception:
-                pass
-        raise RuntimeError(f"Server error (HTTP {e.code}).")
-    except Exception as e:
-        raise RuntimeError(f"Connection error: {e}")
+    max_attempts = 5
+    retry_delay  = 3.0
+    last_err: Optional[Exception] = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp  = opener.open(unlock_url, timeout=15)
+            final = resp.geturl()
+            body  = resp.read()
+            if debug:
+                sys.stderr.write(f"  [auth] final={final} status={resp.status}\n")
+                sys.stderr.write(f"  [auth] body[:200]={body[:200]!r}\n")
+            last_err = None
+            break
+        except urllib.error.HTTPError as e:
+            if debug:
+                try:
+                    err_body = e.read()[:500]
+                    sys.stderr.write(f"\n  [auth] HTTPError {e.code} url={e.url}\n")
+                    sys.stderr.write(f"  [auth] body[:500]={err_body!r}\n")
+                except Exception:
+                    pass
+            if e.code in (502, 503, 504) and attempt < max_attempts:
+                print(f"\n  [auth] tunnel not ready (HTTP {e.code}), retrying in {retry_delay:.0f}s ({attempt}/{max_attempts-1})...",
+                      end="", flush=True)
+                time.sleep(retry_delay)
+                last_err = RuntimeError(f"Server error (HTTP {e.code}).")
+                continue
+            raise RuntimeError(f"Server error (HTTP {e.code}).")
+        except Exception as e:
+            raise RuntimeError(f"Connection error: {e}")
+
+    if last_err:
+        raise last_err
 
     # If passphrase was wrong, server returns 200 with the form again
     # If correct, server 302-redirected to /?t=TOKEN — final URL has the token
@@ -857,7 +916,9 @@ def receive_interactive():
 
     print("=== deliverx receive ===")
     raw_url    = input("Enter URL (e.g. https://abc123.localhost.run): ").strip().rstrip("/")
-    passphrase = input("Enter passphrase: ").strip()
+    passphrase = input("Enter passphrase (e.g. word-word-word-word): ").strip()
+    if passphrase.startswith("http://") or passphrase.startswith("https://"):
+        raise SystemExit("That looks like a URL, not a passphrase. The passphrase is the 'word-word-word-word' shown by the sender.")
     cwd        = Path.cwd()
     dest_input = input(f"Save to [default: {cwd}]: ").strip()
     dest_dir   = Path(dest_input).expanduser().resolve() if dest_input else cwd
