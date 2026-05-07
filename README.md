@@ -87,7 +87,6 @@ deliverx send                                                     deliverx recei
 
 ![Authentication flow](docs/auth_flow.png)
 
-Source: [docs/render_auth_flow.py](docs/render_auth_flow.py) — re-run `python3 docs/render_auth_flow.py` after editing the participant or message lists to regenerate the PNG.
 
 ## Why no third-party uploader
 
