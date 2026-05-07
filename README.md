@@ -14,31 +14,34 @@ with main differences:
 - it can be run by any user (non-root)
 - can deliver both a single file and contents of entire directory
 - uses available public tunnel services 
+- works with every version of Python 3.6 > latest
+
 ---
 ## Quick start
 
 Download the script from this repo
 
 ```
-curl -L -o deliverx.py https://tinyurl.com/perfecto25-deliverx
+curl -L -o deliverx https://tinyurl.com/perfecto25-deliverx
 ```
 
-chmod +x deliverx.py or run directly with 
+chmod +x deliverx or run directly with 
 
 ```
-python3 deliverx.py send myfile
+python3 deliverx send myfile
 ```
 
-You need deliverx.py both on sender and receiver side.
+
+You need deliverx both on sender and receiver side.
 
 
 ```bash
 # Sender — file or directory
-./deliverx.py send /path/to/myfile.zip
-./deliverx.py send ./my_folder
+./deliverx send /path/to/myfile.zip
+./deliverx send ./my_folder
 
 # Receiver
-./deliverx.py receive
+./deliverx receive
 ```
 
 The sender prints the URL and passphrase, both highlighted in yellow:
@@ -60,7 +63,7 @@ By default, deliverx will open a local port 8443 that port forwards to the tunne
 To use a different port, add the --port flag
 
 ```
-./deliverx.py send myfile --port 12999
+./deliverx send myfile --port 12999
 ```
 
 ## How it works
@@ -117,7 +120,7 @@ This script is for one-off transfers where you don't want files sitting on someo
 
 ## Requirements
 
-- Python 3.10+
+- Python 3.6+
 - `ssh` and `openssl` on `$PATH`
 - Outbound TCP/22 (or 443 for pinggy) to the chosen tunnel host
 
