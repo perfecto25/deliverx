@@ -958,11 +958,11 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  deliverx.py send myfile.zip\n"
-            "  deliverx.py send ./my_folder --port 9443\n"
-            "  deliverx.py receive\n"
-            "  deliverx.py          # same as receive\n"
-            "  deliverx.py --version\n"
+            "  deliverx send myfile.zip\n"
+            "  deliverx send ./my_folder --port 9443\n"
+            "  deliverx receive\n"
+            "  deliverx          # same as receive\n"
+            "  deliverx --version\n"
         ),
     )
     sub = ap.add_argument("--version", action="version", version=VERSION)
