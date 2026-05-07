@@ -55,6 +55,14 @@ The sender prints the URL and passphrase, both highlighted in yellow:
 
 Tell the receiver both. They paste the URL and the passphrase; the file streams over the tunnel. Directory transfers show the receiver an indexed list — they can pick by number, range (`1,3-5`), or `all`.
 
+By default, deliverx will open a local port 8443 that port forwards to the tunnel provider
+
+To use a different port, add the --port flag
+
+```
+./deliverx.py send myfile --port 12999
+```
+
 ## How it works
 
 1. **SSH tunnel** — the sender uses a list of public tunnel services (like serveo.net, pinggy or localhost.run). The sender runs `ssh -R 80:localhost:<port> serveo.net` and parses the public URL out of the SSH session output.
